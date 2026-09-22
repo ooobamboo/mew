@@ -17,7 +17,7 @@ MWCPPFLAGS = -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -DVERSION=\"$(VERSION)\"
 MWCFLAGS   = -pedantic -Wall $(INCS) $(MWCPPFLAGS) $(CFLAGS)
 LDLIBS     = $(LIBS)
 
-PROTO = wlr-layer-shell-unstable-v1-protocol.h xdg-activation-v1-protocol.h xdg-shell-protocol.h
+PROTO = wlr-layer-shell-unstable-v1-protocol.h xdg-activation-v1-protocol.h xdg-shell-protocol.h text-input-unstable-v3-protocol.h
 SRC = mew.c $(PROTO:.h=.c)
 OBJ = $(SRC:.c=.o)
 
@@ -49,6 +49,10 @@ wlr-layer-shell-unstable-v1-protocol.h:
 	$(WAYLAND_SCANNER) client-header wlr-layer-shell-unstable-v1.xml $@
 wlr-layer-shell-unstable-v1-protocol.c:
 	$(WAYLAND_SCANNER) private-code wlr-layer-shell-unstable-v1.xml $@
+text-input-unstable-v3-protocol.h:
+	$(WAYLAND_SCANNER) client-header $(WAYLAND_PROTOCOLS)/unstable/text-input/text-input-unstable-v3.xml $@
+text-input-unstable-v3-protocol.c:
+	$(WAYLAND_SCANNER) private-code $(WAYLAND_PROTOCOLS)/unstable/text-input/text-input-unstable-v3.xml $@
 wlr-layer-shell-unstable-v1-protocol.o: xdg-shell-protocol.o
 
 clean:
