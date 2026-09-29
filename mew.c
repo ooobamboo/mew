@@ -901,6 +901,7 @@ keyboard_handle_keymap(void *data, struct wl_keyboard *wl_keyboard,
 		uint32_t format, int32_t fd, uint32_t size)
 {
 	char *map_shm;
+	struct xkb_keymap *new_keymap;
 
 	if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1)
 		die("unknown keymap");
@@ -908,12 +909,20 @@ keyboard_handle_keymap(void *data, struct wl_keyboard *wl_keyboard,
 	map_shm = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
 	if (map_shm == MAP_FAILED)
 		die("mmap:");
-	
-	kbd.xkb_keymap = xkb_keymap_new_from_string(kbd.xkb_context, map_shm,
+
+	new_keymap = xkb_keymap_new_from_string(kbd.xkb_context, map_shm,
 		XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
 	munmap(map_shm, size);
 	close(fd);
 
+	if (!new_keymap)
+		return;
+
+	if (kbd.xkb_state)
+		xkb_state_unref(kbd.xkb_state);
+	if (kbd.xkb_keymap)
+		xkb_keymap_unref(kbd.xkb_keymap);
+	kbd.xkb_keymap = new_keymap;
 	kbd.xkb_state = xkb_state_new(kbd.xkb_keymap);
 }
 
@@ -937,7 +946,12 @@ keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
 {
 	struct itimerspec spec = { 0 };
 	enum wl_keyboard_key_state key_state = _key_state;
-	xkb_keysym_t sym = xkb_state_key_get_one_sym(kbd.xkb_state, key + 8);
+	xkb_keysym_t sym;
+
+	if (!kbd.xkb_state)
+		return;
+	sym = xkb_state_key_get_one_sym(kbd.xkb_state, key + 8);
+
 
 	keyboard_keypress(key_state, sym);
 
@@ -946,7 +960,7 @@ keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
 		kbd.repeat.sym = sym;
 		spec.it_value.tv_sec = kbd.repeat.delay / 1000;
 		spec.it_value.tv_nsec = (kbd.repeat.delay % 1000) * 1000000l;
-	} 
+	}
 	timerfd_settime(kbd.repeat.timer, 0, &spec, NULL);
 }
 
@@ -955,6 +969,8 @@ keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboard,
 		uint32_t serial, uint32_t mods_depressed,
 		uint32_t mods_latched, uint32_t mods_locked, uint32_t group)
 {
+	if (!kbd.xkb_state)
+		return;
 	xkb_state_update_mask(kbd.xkb_state,
 		mods_depressed, mods_latched, mods_locked, 0, 0, group);
 	kbd.ctrl = xkb_state_mod_name_is_active(kbd.xkb_state,
