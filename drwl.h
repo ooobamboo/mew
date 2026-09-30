@@ -196,8 +196,9 @@ drwl_text(Drwl *drwl,
 	pixman_color_t clr;
 	pixman_image_t *fg_pix = NULL;
 	int noellipsis = 0;
-	const struct fcft_glyph *glyph, *eg = NULL;
+	const struct fcft_glyph *glyph, *eg = NULL, *sg;
 	int fcft_subpixel_mode = FCFT_SUBPIXEL_DEFAULT;
+	int tabwidth, x0;
 
 	if (!drwl || (render && (!drwl->scheme || !w || !drwl->image)) || !text || !drwl->font)
 		return 0;
@@ -220,6 +221,12 @@ drwl_text(Drwl *drwl,
 	if (render)
 		eg = fcft_rasterize_char_utf32(drwl->font, 0x2026 /* … */, fcft_subpixel_mode);
 
+	sg = fcft_rasterize_char_utf32(drwl->font, ' ', fcft_subpixel_mode);
+	tabwidth = (sg && sg->advance.x > 0 ? sg->advance.x : drwl->font->height / 2) * 8;
+	if (tabwidth < 1)
+		tabwidth = 1;
+	x0 = x;
+
 	for (const char *p = text, *pp; pp = p, *p; p++) {
 		for (state = UTF8_ACCEPT; *p &&
 		     utf8decode(&state, &cp, *p) > UTF8_REJECT; p++)
@@ -228,6 +235,16 @@ drwl_text(Drwl *drwl,
 			cp = UTF8_INVALID;
 			if (p > pp)
 				p--;
+		}
+
+		if (cp == '\t') {
+			int adv = tabwidth - (x - x0) % tabwidth;
+			if ((unsigned int)adv > w)
+				break;
+			x += adv;
+			w -= adv;
+			last_cp = 0;
+			continue;
 		}
 
 		glyph = fcft_rasterize_char_utf32(drwl->font, cp, fcft_subpixel_mode);
