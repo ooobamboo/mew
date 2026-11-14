@@ -17,7 +17,8 @@ MWCPPFLAGS = -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -DVERSION=\"$(VERSION)\"
 MWCFLAGS   = -pedantic -Wall $(INCS) $(MWCPPFLAGS) $(CFLAGS)
 LDLIBS     = $(LIBS)
 
-PROTO = wlr-layer-shell-unstable-v1-protocol.h xdg-activation-v1-protocol.h xdg-shell-protocol.h text-input-unstable-v3-protocol.h
+PROTO = wlr-layer-shell-unstable-v1-protocol.h xdg-activation-v1-protocol.h xdg-shell-protocol.h \
+	text-input-unstable-v3-protocol.h fractional-scale-v1-protocol.h viewporter-protocol.h
 SRC = mew.c $(PROTO:.h=.c)
 OBJ = $(SRC:.c=.o)
 
@@ -30,6 +31,7 @@ config.h:
 	cp config.def.h $@
 
 $(OBJ): config.h $(PROTO)
+mew.o: ime.h
 
 mew: $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
@@ -53,6 +55,14 @@ text-input-unstable-v3-protocol.h:
 	$(WAYLAND_SCANNER) client-header $(WAYLAND_PROTOCOLS)/unstable/text-input/text-input-unstable-v3.xml $@
 text-input-unstable-v3-protocol.c:
 	$(WAYLAND_SCANNER) private-code $(WAYLAND_PROTOCOLS)/unstable/text-input/text-input-unstable-v3.xml $@
+fractional-scale-v1-protocol.h:
+	$(WAYLAND_SCANNER) client-header $(WAYLAND_PROTOCOLS)/staging/fractional-scale/fractional-scale-v1.xml $@
+fractional-scale-v1-protocol.c:
+	$(WAYLAND_SCANNER) private-code $(WAYLAND_PROTOCOLS)/staging/fractional-scale/fractional-scale-v1.xml $@
+viewporter-protocol.h:
+	$(WAYLAND_SCANNER) client-header $(WAYLAND_PROTOCOLS)/stable/viewporter/viewporter.xml $@
+viewporter-protocol.c:
+	$(WAYLAND_SCANNER) private-code $(WAYLAND_PROTOCOLS)/stable/viewporter/viewporter.xml $@
 wlr-layer-shell-unstable-v1-protocol.o: xdg-shell-protocol.o
 
 clean:

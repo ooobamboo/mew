@@ -21,7 +21,8 @@
 #include "bufpool.h"
 #include "xdg-activation-v1-protocol.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
-#include "text-input-unstable-v3-protocol.h"
+#include "fractional-scale-v1-protocol.h"
+#include "viewporter-protocol.h"
 
 #define TEXTW(X)              (drwl_font_getwidth(drw, (X)) + lrpad)
 
@@ -53,7 +54,7 @@ static struct {
 static char text[BUFSIZ] = "";
 static int bh, mw, mh;
 static int inputw = 0, promptw;
-static int32_t scale = 1;
+static double scale = 1.0; /* preferred surface scale */
 static int lrpad; /* sum of left and right padding */
 static size_t cursor;
 static struct item *items = NULL;
@@ -77,30 +78,19 @@ static Drwl *drw;
 static BufPool pool;
 static struct wl_callback *frame_callback;
 /* default output supplied by compositor */
-static struct wl_output *output = NULL; 
+static struct wl_output *output = NULL;
 
-/* IME (text-input-unstable-v3) */
-static struct zwp_text_input_manager_v3 *text_input_manager;
-static struct zwp_text_input_v3 *text_input;
-
-/* Active preedit string (UTF-8), NULL when no preedit is active */
-static char *preedit_text;
-static int32_t preedit_cursor_begin;
-static int32_t preedit_cursor_end;
-
-/* Double-buffered pending IME state, applied on the next done event */
-static char *ime_preedit_pending;
-static int32_t ime_preedit_begin;
-static int32_t ime_preedit_end;
-static char *ime_commit_pending;
-static uint32_t ime_serial;
-
-/* Cursor rectangle in buffer pixels, updated by drawmenu() */
-static int ime_cursor_x, ime_cursor_y, ime_cursor_w, ime_cursor_h;
-/* Last cursor rectangle sent to the compositor (surface-local coords) */
-static int ime_sent_x = -1, ime_sent_y, ime_sent_w, ime_sent_h;
+/* fractional scale */
+static struct wp_viewporter *viewporter;
+static struct wp_viewport *viewport;
+static struct wp_fractional_scale_manager_v1 *fractional_scale_manager;
+static struct wp_fractional_scale_v1 *fractional_scale;
+static int use_viewport;
+/* logical surface size, as configured by the compositor */
+static int surface_width, surface_height;
 
 #include "config.h"
+#include "ime.h"
 
 static int (*fstrncmp)(const char *, const char *, size_t) = strncmp;
 static char *(*fstrstr)(const char *, const char *) = strstr;
@@ -190,10 +180,10 @@ parse_color(uint32_t *dest, const char *src)
 static void
 loadfonts(void)
 {
-	char fontattrs[12];
+	char fontattrs[16];
 
 	drwl_font_destroy(drw->font);
-	snprintf(fontattrs, sizeof(fontattrs), "dpi=%d", 96 * scale);
+	snprintf(fontattrs, sizeof(fontattrs), "dpi=%.2f", 96.0 * scale);
 	if (!(drwl_font_create(drw, LENGTH(fonts), fonts, fontattrs)))
 		die("no fonts could be loaded");
 
@@ -251,18 +241,21 @@ cleanup(void)
 		free(items[i].text);
 	free(items);
 
-	free(preedit_text);
-	free(ime_preedit_pending);
-	free(ime_commit_pending);
-	if (text_input)
-		zwp_text_input_v3_destroy(text_input);
-	if (text_input_manager)
-		zwp_text_input_manager_v3_destroy(text_input_manager);
+	ime_cleanup();
 
 	bufpool_cleanup(&pool);
 	drwl_setimage(drw, NULL);
 	drwl_destroy(drw);
 	drwl_fini();
+
+	if (fractional_scale)
+		wp_fractional_scale_v1_destroy(fractional_scale);
+	if (viewport)
+		wp_viewport_destroy(viewport);
+	if (fractional_scale_manager)
+		wp_fractional_scale_manager_v1_destroy(fractional_scale_manager);
+	if (viewporter)
+		wp_viewporter_destroy(viewporter);
 
 	wl_data_device_release(data_device);
 	zwlr_layer_shell_v1_destroy(layer_shell);
@@ -289,157 +282,6 @@ cistrstr(const char *h, const char *n)
 			return (char *)h;
 	}
 	return NULL;
-}
-
-static void
-draw_ime_cursor(int x)
-{
-	int cy = (bh - drw->font->height) / 2 + 1;
-	int ch = drw->font->height - 2;
-
-	drwl_setscheme(drw, colors[SchemeNorm]);
-	drwl_rect(drw, x, cy, 2, ch, 1, 0);
-
-	ime_cursor_x = x;
-	ime_cursor_y = cy;
-	ime_cursor_w = 2;
-	ime_cursor_h = ch;
-}
-
-/*
- * Draw the active IME preedit string at the cursor position.  All preedit
- * glyphs are underlined and a bar cursor is drawn at the byte offset given by
- * preedit_cursor_begin (-1 hides it).  Returns the new x position.
- */
-static int
-draw_preedit(int x, int max_x)
-{
-	struct fcft_font *font = drw->font;
-	const int ty = (bh - font->height) / 2 + font->ascent;
-	const int ul_y = ty - font->underline.position;
-	const int ul_h = MAX(1, font->underline.thickness);
-	enum fcft_subpixel subpixel = FCFT_SUBPIXEL_DEFAULT;
-	pixman_color_t clr = convert_color(colors[SchemeNorm][ColFg]);
-	pixman_image_t *fg;
-	const char *p = preedit_text;
-	uint32_t last_cp = 0;
-	size_t byte = 0;
-	int cursor_drawn = 0;
-
-	if ((colors[SchemeNorm][ColBg] & 0xFF) != 0xFF)
-		subpixel = FCFT_SUBPIXEL_NONE;
-
-	fg = pixman_image_create_solid_fill(&clr);
-
-	while (*p) {
-		uint32_t cp = 0, state = UTF8_ACCEPT;
-		const char *start = p;
-		size_t cp_len;
-		const struct fcft_glyph *glyph;
-		long x_kern = 0;
-		int pixels_needed, glyph_start_x;
-
-		for (; *p && utf8decode(&state, &cp, *p) > UTF8_REJECT; p++)
-			;
-		if (!*p || state == UTF8_REJECT) {
-			cp = UTF8_INVALID;
-			if (p > start)
-				p--;
-		}
-		p++;
-		cp_len = p - start;
-
-		if (preedit_cursor_begin >= 0 &&
-		    (int32_t)byte == preedit_cursor_begin) {
-			draw_ime_cursor(x);
-			cursor_drawn = 1;
-		}
-
-		glyph = fcft_rasterize_char_utf32(font, cp, subpixel);
-		if (glyph == NULL) {
-			byte += cp_len;
-			last_cp = 0;
-			continue;
-		}
-
-		if (last_cp)
-			fcft_kerning(font, last_cp, cp, &x_kern, NULL);
-		x += x_kern;
-
-		pixels_needed = MAX(glyph->x + glyph->width, glyph->advance.x);
-		if (x + pixels_needed > max_x)
-			break;
-
-		glyph_start_x = x;
-
-		if (pixman_image_get_format(glyph->pix) == PIXMAN_a8r8g8b8)
-			pixman_image_composite32(PIXMAN_OP_OVER, glyph->pix, NULL,
-				drw->image, 0, 0, 0, 0,
-				x + glyph->x, ty - glyph->y,
-				glyph->width, glyph->height);
-		else
-			pixman_image_composite32(PIXMAN_OP_OVER, fg, glyph->pix,
-				drw->image, 0, 0, 0, 0,
-				x + glyph->x, ty - glyph->y,
-				glyph->width, glyph->height);
-
-		x += glyph->advance.x;
-
-		pixman_image_fill_rectangles(PIXMAN_OP_SRC, drw->image, &clr, 1,
-			&(pixman_rectangle16_t){glyph_start_x, ul_y,
-				x - glyph_start_x, ul_h});
-
-		last_cp = cp;
-		byte += cp_len;
-	}
-
-	if (preedit_cursor_begin < 0 || !cursor_drawn)
-		draw_ime_cursor(x);
-
-	pixman_image_unref(fg);
-	return x;
-}
-
-static void
-text_input_send_cursor_rect(void)
-{
-	int sx, sy, sw, sh;
-
-	if (text_input == NULL)
-		return;
-
-	sx = ime_cursor_x / scale;
-	sy = ime_cursor_y / scale;
-	sw = MAX(1, ime_cursor_w / scale);
-	sh = MAX(1, ime_cursor_h / scale);
-
-	zwp_text_input_v3_set_cursor_rectangle(text_input, sx, sy, sw, sh);
-	zwp_text_input_v3_commit(text_input);
-	ime_serial++;
-	ime_sent_x = sx;
-	ime_sent_y = sy;
-	ime_sent_w = sw;
-	ime_sent_h = sh;
-}
-
-static void
-text_input_update_cursor_rect(void)
-{
-	int sx, sy, sw, sh;
-
-	if (text_input == NULL || ime_cursor_w == 0)
-		return;
-
-	sx = ime_cursor_x / scale;
-	sy = ime_cursor_y / scale;
-	sw = MAX(1, ime_cursor_w / scale);
-	sh = MAX(1, ime_cursor_h / scale);
-
-	if (sx == ime_sent_x && sy == ime_sent_y &&
-	    sw == ime_sent_w && sh == ime_sent_h)
-		return;
-
-	text_input_send_cursor_rect();
 }
 
 static int
@@ -513,16 +355,9 @@ drawmenu(void)
 			drwl_text(drw, x, 0, w, bh, lrpad / 2, text, 0);
 
 		curpos = TEXTW(text) - TEXTW(&text[cursor]);
-		if ((curpos += lrpad / 2 - 1) < w) {
-			drwl_setscheme(drw, colors[SchemeNorm]);
-			drwl_rect(drw, x + curpos,
-				(bh - drw->font->height) / 2 + 1,
-				2, drw->font->height - 2, 1, 0);
-			ime_cursor_x = x + curpos;
-			ime_cursor_y = (bh - drw->font->height) / 2 + 1;
-			ime_cursor_w = 2;
-			ime_cursor_h = drw->font->height - 2;
-		} else
+		if ((curpos += lrpad / 2 - 1) < w)
+			draw_ime_cursor(x + curpos);
+		else
 			ime_cursor_w = 0;
 	}
 
@@ -549,7 +384,10 @@ drawmenu(void)
 	}
 
 	drwl_setimage(drw, NULL);
-	wl_surface_set_buffer_scale(surface, scale);
+	if (use_viewport)
+		wp_viewport_set_destination(viewport, surface_width, surface_height);
+	else
+		wl_surface_set_buffer_scale(surface, (int32_t)scale);
 	wl_surface_attach(surface, buf->wl_buf, 0, 0);
 	wl_surface_damage_buffer(surface, 0, 0, mw, mh);
 	wl_surface_commit(surface);
@@ -571,7 +409,7 @@ static const struct wl_callback_listener frame_callback_listener = {
 };
 
 static void
-redraw()
+redraw(void)
 {
 	if (frame_callback)
 		return;
@@ -1013,158 +851,21 @@ static const struct wl_keyboard_listener keyboard_listener = {
 	.repeat_info = keyboard_handle_repeat_info,
 };
 
-/*---------------------------------------------------------------------------
- * text-input-unstable-v3
- *---------------------------------------------------------------------------*/
-
-static void
-text_input_handle_enter(void *data, struct zwp_text_input_v3 *ti,
-		struct wl_surface *surface)
-{
-	free(ime_preedit_pending);
-	ime_preedit_pending = NULL;
-	free(ime_commit_pending);
-	ime_commit_pending = NULL;
-
-	zwp_text_input_v3_enable(ti);
-	zwp_text_input_v3_set_content_type(ti,
-		ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE,
-		ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
-
-	/* enable + content type must be committed; also report the cursor */
-	text_input_send_cursor_rect();
-}
-
-static void
-text_input_handle_leave(void *data, struct zwp_text_input_v3 *ti,
-		struct wl_surface *surface)
-{
-	free(ime_preedit_pending);
-	ime_preedit_pending = NULL;
-	free(ime_commit_pending);
-	ime_commit_pending = NULL;
-
-	if (preedit_text) {
-		free(preedit_text);
-		preedit_text = NULL;
-		redraw();
-	}
-
-	zwp_text_input_v3_disable(ti);
-	zwp_text_input_v3_commit(ti);
-	ime_serial++;
-}
-
-static void
-text_input_handle_preedit_string(void *data, struct zwp_text_input_v3 *ti,
-		const char *text, int32_t cursor_begin, int32_t cursor_end)
-{
-	free(ime_preedit_pending);
-	ime_preedit_pending = text ? strdup(text) : NULL;
-	ime_preedit_begin = cursor_begin;
-	ime_preedit_end = cursor_end;
-}
-
-static void
-text_input_handle_commit_string(void *data, struct zwp_text_input_v3 *ti,
-		const char *text)
-{
-	free(ime_commit_pending);
-	ime_commit_pending = text ? strdup(text) : NULL;
-}
-
-static void
-text_input_handle_delete_surrounding_text(void *data,
-		struct zwp_text_input_v3 *ti,
-		uint32_t before_length, uint32_t after_length)
-{
-	/* We never set surrounding text, so nothing to delete */
-}
-
-static void
-text_input_handle_done(void *data, struct zwp_text_input_v3 *ti,
-		uint32_t serial)
-{
-	bool refresh = false;
-
-	/*
-	 * The serial echoes the number of commit() requests we have made.
-	 * Discard stale events.
-	 */
-	if (serial != ime_serial) {
-		free(ime_preedit_pending);
-		ime_preedit_pending = NULL;
-		free(ime_commit_pending);
-		ime_commit_pending = NULL;
-		return;
-	}
-
-	/* 1. Replace existing preedit */
-	if (preedit_text) {
-		free(preedit_text);
-		preedit_text = NULL;
-		refresh = true;
-	}
-
-	/* 3. Insert commit string at the cursor */
-	if (ime_commit_pending) {
-		insert(ime_commit_pending, strlen(ime_commit_pending));
-		free(ime_commit_pending);
-		ime_commit_pending = NULL;
-		refresh = true;
-	}
-
-	/* 5 & 6. Insert new preedit, place cursor inside it */
-	if (ime_preedit_pending && ime_preedit_pending[0] != '\0') {
-		preedit_text = ime_preedit_pending;
-		preedit_cursor_begin = ime_preedit_begin;
-		preedit_cursor_end = ime_preedit_end;
-		ime_preedit_pending = NULL;
-		refresh = true;
-	} else {
-		free(ime_preedit_pending);
-		ime_preedit_pending = NULL;
-	}
-
-	if (refresh)
-		redraw();
-}
-
-static const struct zwp_text_input_v3_listener text_input_listener = {
-	.enter = text_input_handle_enter,
-	.leave = text_input_handle_leave,
-	.preedit_string = text_input_handle_preedit_string,
-	.commit_string = text_input_handle_commit_string,
-	.delete_surrounding_text = text_input_handle_delete_surrounding_text,
-	.done = text_input_handle_done,
-};
-
-static void
-text_input_create(void)
-{
-	if (text_input_manager == NULL || seat == NULL || text_input != NULL)
-		return;
-
-	text_input = zwp_text_input_manager_v3_get_text_input(
-		text_input_manager, seat);
-	if (text_input == NULL)
-		return;
-
-	zwp_text_input_v3_add_listener(text_input, &text_input_listener, NULL);
-}
-
 static void
 layer_surface_handle_configure(void *data, struct zwlr_layer_surface_v1 *layer_surface,
 		uint32_t serial, uint32_t width, uint32_t height)
 {
-	if (mw / scale == width && mh / scale == height)
-		return;
-
-	mw = width * scale;
-	mh = height * scale;
+	surface_width = MAX(1, (int)width);
+	surface_height = MAX(1, (int)height);
+	mw = MAX(1, (int)(surface_width * scale + 0.5));
+	mh = MAX(1, (lines + 1) * bh);
 	inputw = mw / 3; /* input width: ~33% of output width */
-	match();
+
+	if (use_viewport)
+		wp_viewport_set_destination(viewport, surface_width, surface_height);
+
 	zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
+	match();
 	drawmenu();
 }
 
@@ -1179,18 +880,60 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 	.closed = layer_surface_handle_closed,
 };
 
-static void 
-surface_handle_preferred_scale(void *data,
-	struct wl_surface *wl_surface, int32_t factor)
+/*
+ * Recreate the font at the new scale and request a matching surface size.
+ * The requested size is in surface-local coordinates, while the buffer keeps
+ * its natural pixel size; wp_viewport maps the two together.
+ */
+static void
+resize_for_scale(void)
 {
-	if (scale == factor)
-		return;
-	scale = factor;
 	loadfonts();
 
-	/* the scale of the surface is only known after an initial draw, not before :( */
-	zwlr_layer_surface_v1_set_size(layer_surface, 0, mh / scale);
+	if (layer_surface)
+		zwlr_layer_surface_v1_set_size(layer_surface, 0,
+			MAX(1, (int)(mh / scale)));
+
+	if (surface_width == 0)
+		return;
+
+	mw = MAX(1, (int)(surface_width * scale + 0.5));
+	inputw = mw / 3;
+	match();
 	redraw();
+}
+
+static void
+fractional_scale_handle_preferred_scale(void *data,
+		struct wp_fractional_scale_v1 *fractional_scale, uint32_t scale120)
+{
+	double new_scale;
+
+	if (!use_viewport || scale120 == 0)
+		return;
+
+	new_scale = scale120 / 120.0;
+	if (new_scale == scale)
+		return;
+
+	scale = new_scale;
+	resize_for_scale();
+}
+
+static const struct wp_fractional_scale_v1_listener fractional_scale_listener = {
+	.preferred_scale = fractional_scale_handle_preferred_scale,
+};
+
+static void
+surface_handle_preferred_scale(void *data, struct wl_surface *wl_surface,
+		int32_t factor)
+{
+	/* wp_fractional_scale_v1 gives the exact scale when it is available */
+	if (use_viewport || factor <= 0 || factor == scale)
+		return;
+
+	scale = factor;
+	resize_for_scale();
 }
 
 static const struct wl_surface_listener surface_listener = {
@@ -1281,6 +1024,12 @@ registry_handle_global(void *data, struct wl_registry *registry,
 		text_input_manager = wl_registry_bind(registry, name,
 			&zwp_text_input_manager_v3_interface, 1);
 		text_input_create();
+	} else if (!strcmp(interface, wp_viewporter_interface.name)) {
+		viewporter = wl_registry_bind(registry, name,
+			&wp_viewporter_interface, 1);
+	} else if (!strcmp(interface, wp_fractional_scale_manager_v1_interface.name)) {
+		fractional_scale_manager = wl_registry_bind(registry, name,
+			&wp_fractional_scale_manager_v1_interface, 1);
 	}
 }
 
@@ -1324,13 +1073,13 @@ readstdin(void)
 static void
 run(void)
 {
-	struct pollfd pfds[] = { 
+	struct pollfd pfds[] = {
 		{ wl_display_get_fd(display), POLLIN },
 		{ kbd.repeat.timer, POLLIN },
-	}; 
+	};
 
 	running = 1;
-	while (running) { 
+	while (running) {
 		wl_display_flush(display);
 
 		if (poll(pfds, LENGTH(pfds), -1) < 0)
@@ -1355,7 +1104,7 @@ setup(void)
 	wl_registry_add_listener(registry, &registry_listener, NULL);
 	wl_display_roundtrip(display);
 	wl_display_roundtrip(display); /* output & seat listeners */
-	
+
 	if (!compositor)
 		die("wl_compositor not available");
 	if (!shm)
@@ -1380,11 +1129,28 @@ setup(void)
 	surface = wl_compositor_create_surface(compositor);
 	wl_surface_add_listener(surface, &surface_listener, NULL);
 
+	/*
+	 * The preferred scale is only advertised after the surface is mapped,
+	 * so the initial size is computed at scale 1 and corrected later by
+	 * resize_for_scale().
+	 */
+	if (viewporter && fractional_scale_manager) {
+		viewport = wp_viewporter_get_viewport(viewporter, surface);
+		fractional_scale =
+			wp_fractional_scale_manager_v1_get_fractional_scale(
+				fractional_scale_manager, surface);
+		if (viewport && fractional_scale) {
+			wp_fractional_scale_v1_add_listener(fractional_scale,
+				&fractional_scale_listener, NULL);
+			use_viewport = 1;
+		}
+	}
+
 	layer_surface = zwlr_layer_shell_v1_get_layer_surface(layer_shell,
 				surface, output, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "mew");
 	zwlr_layer_surface_v1_set_size(layer_surface, 0, mh);
-	zwlr_layer_surface_v1_set_anchor(layer_surface, 
-		(top ? ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP : ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM ) |
+	zwlr_layer_surface_v1_set_anchor(layer_surface,
+		(top ? ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP : ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM) |
 		ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
 	zwlr_layer_surface_v1_set_exclusive_zone(layer_surface, -1);
 	zwlr_layer_surface_v1_set_keyboard_interactivity(layer_surface, 1);
@@ -1414,7 +1180,7 @@ main(int argc, char *argv[])
 			top = 0;
 		else if (!strcmp(argv[i], "-e"))
 			submit = exec_cmd;
-		else if (!strcmp(argv[i], "-i")) { 
+		else if (!strcmp(argv[i], "-i")) {
 			fstrncmp = strncasecmp;
 			fstrstr = cistrstr;
 		} else if (!strcmp(argv[i], "-P"))

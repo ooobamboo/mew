@@ -3,7 +3,7 @@
 
 echo 'OK Pleased to meet you'
 
-while read -r stdin; do 
+while read -r stdin; do
 	case $stdin in
 		*BYE*) exit ;;
 		*SETDESC*) KEYNAME=${stdin#*:%0A%22}; KEYNAME=${KEYNAME%\%22\%0A*}; KEYID=${stdin#*ID }; KEYID=${KEYID%,*} ;;
