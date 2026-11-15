@@ -55,6 +55,8 @@ static char text[BUFSIZ] = "";
 static int bh, mw, mh;
 static int inputw = 0, promptw;
 static double scale = 1.0; /* preferred surface scale */
+static int scale_known; /* the compositor reported its preferred scale */
+static int draw_ready; /* the surface is sized for the current scale */
 static int lrpad; /* sum of left and right padding */
 static size_t cursor;
 static struct item *items = NULL;
@@ -297,6 +299,37 @@ drawitem(struct item *item, int x, int y, int w)
 	return drwl_text(drw, x, y, w, bh, lrpad / 2, item->text, 0);
 }
 
+/*
+ * Map the surface without showing anything while the compositor settles on
+ * the final scale and size.  This avoids flashing the pre-scale height first.
+ */
+static void
+draw_blank(void)
+{
+	pixman_color_t transparent = { 0 };
+	pixman_rectangle16_t rect;
+	DrwBuf *buf;
+
+	if (surface_width == 0 || mw == 0 || mh == 0)
+		return;
+
+	errno = 0;
+	if (!(buf = bufpool_getbuf(&pool, shm, mw, mh)))
+		die(errno ? "bufpool_getbuf:" : "no buffer available");
+
+	rect = (pixman_rectangle16_t){0, 0, mw, mh};
+	pixman_image_fill_rectangles(PIXMAN_OP_SRC, buf->image, &transparent,
+		1, &rect);
+
+	if (use_viewport)
+		wp_viewport_set_destination(viewport, surface_width, surface_height);
+	else
+		wl_surface_set_buffer_scale(surface, (int32_t)scale);
+	wl_surface_attach(surface, buf->wl_buf, 0, 0);
+	wl_surface_damage_buffer(surface, 0, 0, mw, mh);
+	wl_surface_commit(surface);
+}
+
 static void
 drawmenu(void)
 {
@@ -305,6 +338,11 @@ drawmenu(void)
 	int x = 0, y = 0, w;
 	char *censort;
 	DrwBuf *buf;
+
+	if (use_viewport && !draw_ready) {
+		draw_blank();
+		return;
+	}
 
 	errno = 0;
 	if (!(buf = bufpool_getbuf(&pool, shm, mw, mh)))
@@ -855,16 +893,32 @@ static void
 layer_surface_handle_configure(void *data, struct zwlr_layer_surface_v1 *layer_surface,
 		uint32_t serial, uint32_t width, uint32_t height)
 {
+	int expected_height;
+
 	surface_width = MAX(1, (int)width);
 	surface_height = MAX(1, (int)height);
 	mw = MAX(1, (int)(surface_width * scale + 0.5));
 	mh = MAX(1, (lines + 1) * bh);
 	inputw = mw / 3; /* input width: ~33% of output width */
+	expected_height = MAX(1, (int)(mh / scale));
 
 	if (use_viewport)
 		wp_viewport_set_destination(viewport, surface_width, surface_height);
 
 	zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
+
+	/*
+	 * Before the preferred scale is known, or while a resize is still
+	 * pending, only map a transparent buffer.  The compositor will send
+	 * the matching configure once the request has been applied.
+	 */
+	if (!use_viewport)
+		draw_ready = 1;
+	else if (!scale_known || (!draw_ready && (int)height != expected_height))
+		draw_ready = 0;
+	else
+		draw_ready = 1;
+
 	match();
 	drawmenu();
 }
@@ -888,17 +942,24 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 static void
 resize_for_scale(void)
 {
+	int requested;
+
+	scale_known = 1;
 	loadfonts();
+	requested = MAX(1, (int)(mh / scale));
 
 	if (layer_surface)
-		zwlr_layer_surface_v1_set_size(layer_surface, 0,
-			MAX(1, (int)(mh / scale)));
+		zwlr_layer_surface_v1_set_size(layer_surface, 0, requested);
 
 	if (surface_width == 0)
 		return;
 
 	mw = MAX(1, (int)(surface_width * scale + 0.5));
 	inputw = mw / 3;
+
+	if (use_viewport && !draw_ready && requested == surface_height)
+		draw_ready = 1;
+
 	match();
 	redraw();
 }
@@ -913,7 +974,7 @@ fractional_scale_handle_preferred_scale(void *data,
 		return;
 
 	new_scale = scale120 / 120.0;
-	if (new_scale == scale)
+	if (scale_known && new_scale == scale)
 		return;
 
 	scale = new_scale;
@@ -929,7 +990,7 @@ surface_handle_preferred_scale(void *data, struct wl_surface *wl_surface,
 		int32_t factor)
 {
 	/* wp_fractional_scale_v1 gives the exact scale when it is available */
-	if (use_viewport || factor <= 0 || factor == scale)
+	if (use_viewport || factor <= 0 || (scale_known && factor == scale))
 		return;
 
 	scale = factor;
